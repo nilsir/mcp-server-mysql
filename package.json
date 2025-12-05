@@ -1,6 +1,6 @@
 {
   "name": "@nilsir/mcp-server-mysql",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "MCP server for MySQL database operations",
   "main": "dist/index.js",
   "type": "module",
@@ -27,7 +27,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/nilsir/mcp-server-mysql.git"
+  },
+  "homepage": "https://github.com/nilsir/mcp-server-mysql#readme",
+  "bugs": {
+    "url": "https://github.com/nilsir/mcp-server-mysql/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",
