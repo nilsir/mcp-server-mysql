@@ -1,12 +1,9 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
 import mysql, { Pool, RowDataPacket, ResultSetHeader } from "mysql2/promise";
+import { z } from "zod";
 
 // Connection pool
 let pool: Pool | null = null;
@@ -45,6 +42,36 @@ function checkSqlPermission(sql: string): void {
   }
 }
 
+// Validate that a query is read-only (for the query tool)
+function validateReadOnlyQuery(sql: string): void {
+  const normalizedSql = sql.trim().toUpperCase();
+
+  // List of forbidden keywords for read-only queries
+  const forbiddenKeywords = [
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "DROP",
+    "CREATE",
+    "ALTER",
+    "TRUNCATE",
+    "RENAME",
+    "REPLACE",
+    "GRANT",
+    "REVOKE",
+    "LOCK",
+    "UNLOCK",
+  ];
+
+  for (const keyword of forbiddenKeywords) {
+    if (normalizedSql.startsWith(keyword)) {
+      throw new Error(
+        `${keyword} operations are not allowed in query tool. Use the execute tool for data modifications or appropriate DDL tools for schema changes.`
+      );
+    }
+  }
+}
+
 // Initialize connection pool
 async function getPool(): Promise<Pool> {
   if (!pool) {
@@ -53,639 +80,566 @@ async function getPool(): Promise<Pool> {
   return pool;
 }
 
-// Create MCP server
-const server = new Server(
-  {
-    name: "mcp-server-mysql",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-// Define available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "connect",
-        description:
-          "Connect to a MySQL database. If not called explicitly, will use environment variables for connection.",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            host: { type: "string", description: "Database host" },
-            port: { type: "number", description: "Database port" },
-            user: { type: "string", description: "Database user" },
-            password: { type: "string", description: "Database password" },
-            database: { type: "string", description: "Database name" },
-          },
-        },
-      },
-      {
-        name: "query",
-        description:
-          "Execute a SELECT query and return results. Use this for reading data.",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            sql: { type: "string", description: "SQL SELECT query to execute" },
-            params: {
-              type: "array",
-              items: {},
-              description: "Query parameters for prepared statement",
-            },
-          },
-          required: ["sql"],
-        },
-      },
-      {
-        name: "execute",
-        description:
-          "Execute an INSERT, UPDATE, DELETE or other modifying query. Returns affected rows count.",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            sql: { type: "string", description: "SQL query to execute" },
-            params: {
-              type: "array",
-              items: {},
-              description: "Query parameters for prepared statement",
-            },
-          },
-          required: ["sql"],
-        },
-      },
-      {
-        name: "list_databases",
-        description: "List all databases on the MySQL server",
-        inputSchema: {
-          type: "object" as const,
-          properties: {},
-        },
-      },
-      {
-        name: "list_tables",
-        description: "List all tables in the current or specified database",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            database: {
-              type: "string",
-              description: "Database name (optional, uses current if not specified)",
-            },
-          },
-        },
-      },
-      {
-        name: "describe_table",
-        description: "Get the structure/schema of a table",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            table: { type: "string", description: "Table name" },
-            database: {
-              type: "string",
-              description: "Database name (optional)",
-            },
-          },
-          required: ["table"],
-        },
-      },
-      {
-        name: "create_table",
-        description: "Create a new table with specified columns",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            table: { type: "string", description: "Table name" },
-            columns: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  name: { type: "string", description: "Column name" },
-                  type: {
-                    type: "string",
-                    description: "Column type (e.g., VARCHAR(255), INT, TEXT)",
-                  },
-                  nullable: {
-                    type: "boolean",
-                    description: "Whether column can be null",
-                  },
-                  primaryKey: {
-                    type: "boolean",
-                    description: "Whether this is the primary key",
-                  },
-                  autoIncrement: {
-                    type: "boolean",
-                    description: "Whether to auto increment",
-                  },
-                  default: {
-                    type: "string",
-                    description: "Default value",
-                  },
-                },
-                required: ["name", "type"],
-              },
-              description: "Column definitions",
-            },
-            database: {
-              type: "string",
-              description: "Database name (optional)",
-            },
-          },
-          required: ["table", "columns"],
-        },
-      },
-      {
-        name: "alter_table",
-        description: "Modify an existing table structure",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            table: { type: "string", description: "Table name" },
-            operation: {
-              type: "string",
-              enum: ["ADD", "DROP", "MODIFY", "RENAME"],
-              description: "Type of alteration",
-            },
-            column: { type: "string", description: "Column name" },
-            definition: {
-              type: "string",
-              description:
-                "Column definition for ADD/MODIFY (e.g., 'VARCHAR(255) NOT NULL')",
-            },
-            newName: {
-              type: "string",
-              description: "New name for RENAME operation",
-            },
-            database: {
-              type: "string",
-              description: "Database name (optional)",
-            },
-          },
-          required: ["table", "operation", "column"],
-        },
-      },
-      {
-        name: "drop_table",
-        description: "Drop/delete a table",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            table: { type: "string", description: "Table name" },
-            database: {
-              type: "string",
-              description: "Database name (optional)",
-            },
-          },
-          required: ["table"],
-        },
-      },
-      {
-        name: "create_database",
-        description: "Create a new database",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            database: { type: "string", description: "Database name" },
-            charset: {
-              type: "string",
-              description: "Character set (default: utf8mb4)",
-            },
-            collation: {
-              type: "string",
-              description: "Collation (default: utf8mb4_unicode_ci)",
-            },
-          },
-          required: ["database"],
-        },
-      },
-      {
-        name: "drop_database",
-        description: "Drop/delete a database",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            database: { type: "string", description: "Database name" },
-          },
-          required: ["database"],
-        },
-      },
-      {
-        name: "use_database",
-        description: "Switch to a different database",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            database: { type: "string", description: "Database name" },
-          },
-          required: ["database"],
-        },
-      },
-      {
-        name: "create_index",
-        description: "Create an index on a table",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            table: { type: "string", description: "Table name" },
-            indexName: { type: "string", description: "Index name" },
-            columns: {
-              type: "array",
-              items: { type: "string" },
-              description: "Column names to index",
-            },
-            unique: {
-              type: "boolean",
-              description: "Whether this is a unique index",
-            },
-            database: {
-              type: "string",
-              description: "Database name (optional)",
-            },
-          },
-          required: ["table", "indexName", "columns"],
-        },
-      },
-      {
-        name: "drop_index",
-        description: "Drop an index from a table",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            table: { type: "string", description: "Table name" },
-            indexName: { type: "string", description: "Index name" },
-            database: {
-              type: "string",
-              description: "Database name (optional)",
-            },
-          },
-          required: ["table", "indexName"],
-        },
-      },
-    ],
-  };
+// Create MCP server using high-level McpServer API
+const server = new McpServer({
+  name: "mcp-server-mysql",
+  version: "1.0.0",
 });
 
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+// Tool: connect
+server.tool(
+  "connect",
+  "Connect to a MySQL database. If not called explicitly, will use environment variables for connection.",
+  {
+    host: z.string().optional().describe("Database host"),
+    port: z.number().optional().describe("Database port"),
+    user: z.string().optional().describe("Database user"),
+    password: z.string().optional().describe("Database password"),
+    database: z.string().optional().describe("Database name"),
+  },
+  async ({ host, port, user, password, database }) => {
+    const config = {
+      host: host || process.env.MYSQL_HOST || "localhost",
+      port: port || parseInt(process.env.MYSQL_PORT || "3306", 10),
+      user: user || process.env.MYSQL_USER || "root",
+      password: password || process.env.MYSQL_PASSWORD || "",
+      database: database,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+    };
 
-  try {
-    switch (name) {
-      case "connect": {
-        const config = {
-          host: (args?.host as string) || process.env.MYSQL_HOST || "localhost",
-          port: (args?.port as number) || parseInt(process.env.MYSQL_PORT || "3306", 10),
-          user: (args?.user as string) || process.env.MYSQL_USER || "root",
-          password: (args?.password as string) || process.env.MYSQL_PASSWORD || "",
-          database: args?.database as string | undefined,
-          waitForConnections: true,
-          connectionLimit: 10,
-          queueLimit: 0,
-        };
-
-        // Close existing pool if any
-        if (pool) {
-          await pool.end();
-        }
-
-        pool = mysql.createPool(config);
-
-        // Test connection
-        const connection = await pool.getConnection();
-        connection.release();
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Successfully connected to MySQL server at ${config.host}:${config.port}${config.database ? ` (database: ${config.database})` : ""}`,
-            },
-          ],
-        };
-      }
-
-      case "query": {
-        const p = await getPool();
-        const sql = args?.sql as string;
-        const params = (args?.params as unknown[]) || [];
-
-        const [rows] = await p.query<RowDataPacket[]>(sql, params);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(rows, null, 2),
-            },
-          ],
-        };
-      }
-
-      case "execute": {
-        const p = await getPool();
-        const sql = args?.sql as string;
-        const params = (args?.params as unknown[]) || [];
-
-        // Check if the operation is allowed
-        checkSqlPermission(sql);
-
-        const [result] = await p.execute<ResultSetHeader>(sql, params);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  affectedRows: result.affectedRows,
-                  insertId: result.insertId,
-                  changedRows: result.changedRows,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      }
-
-      case "list_databases": {
-        const p = await getPool();
-        const [rows] = await p.query<RowDataPacket[]>("SHOW DATABASES");
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                rows.map((row) => row.Database),
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      }
-
-      case "list_tables": {
-        const p = await getPool();
-        const database = args?.database as string | undefined;
-
-        let sql = "SHOW TABLES";
-        if (database) {
-          sql = `SHOW TABLES FROM \`${database}\``;
-        }
-
-        const [rows] = await p.query<RowDataPacket[]>(sql);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                rows.map((row) => Object.values(row)[0]),
-                null,
-                2
-              ),
-            },
-          ],
-        };
-      }
-
-      case "describe_table": {
-        const p = await getPool();
-        const table = args?.table as string;
-        const database = args?.database as string | undefined;
-
-        const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
-        const [rows] = await p.query<RowDataPacket[]>(`DESCRIBE ${tableName}`);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(rows, null, 2),
-            },
-          ],
-        };
-      }
-
-      case "create_table": {
-        const p = await getPool();
-        const table = args?.table as string;
-        const columns = args?.columns as Array<{
-          name: string;
-          type: string;
-          nullable?: boolean;
-          primaryKey?: boolean;
-          autoIncrement?: boolean;
-          default?: string;
-        }>;
-        const database = args?.database as string | undefined;
-
-        const columnDefs = columns.map((col) => {
-          let def = `\`${col.name}\` ${col.type}`;
-          if (col.nullable === false) def += " NOT NULL";
-          if (col.autoIncrement) def += " AUTO_INCREMENT";
-          if (col.default !== undefined) def += ` DEFAULT ${col.default}`;
-          if (col.primaryKey) def += " PRIMARY KEY";
-          return def;
-        });
-
-        const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
-        const sql = `CREATE TABLE ${tableName} (${columnDefs.join(", ")})`;
-
-        await p.execute(sql);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Table ${table} created successfully`,
-            },
-          ],
-        };
-      }
-
-      case "alter_table": {
-        const p = await getPool();
-        const table = args?.table as string;
-        const operation = args?.operation as string;
-        const column = args?.column as string;
-        const definition = args?.definition as string | undefined;
-        const newName = args?.newName as string | undefined;
-        const database = args?.database as string | undefined;
-
-        const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
-        let sql: string;
-
-        switch (operation) {
-          case "ADD":
-            sql = `ALTER TABLE ${tableName} ADD COLUMN \`${column}\` ${definition}`;
-            break;
-          case "DROP":
-            sql = `ALTER TABLE ${tableName} DROP COLUMN \`${column}\``;
-            break;
-          case "MODIFY":
-            sql = `ALTER TABLE ${tableName} MODIFY COLUMN \`${column}\` ${definition}`;
-            break;
-          case "RENAME":
-            sql = `ALTER TABLE ${tableName} RENAME COLUMN \`${column}\` TO \`${newName}\``;
-            break;
-          default:
-            throw new Error(`Unknown operation: ${operation}`);
-        }
-
-        await p.execute(sql);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Table ${table} altered successfully (${operation} ${column})`,
-            },
-          ],
-        };
-      }
-
-      case "drop_table": {
-        const p = await getPool();
-        const table = args?.table as string;
-        const database = args?.database as string | undefined;
-
-        const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
-        await p.execute(`DROP TABLE ${tableName}`);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Table ${table} dropped successfully`,
-            },
-          ],
-        };
-      }
-
-      case "create_database": {
-        const p = await getPool();
-        const database = args?.database as string;
-        const charset = (args?.charset as string) || "utf8mb4";
-        const collation = (args?.collation as string) || "utf8mb4_unicode_ci";
-
-        await p.execute(
-          `CREATE DATABASE \`${database}\` CHARACTER SET ${charset} COLLATE ${collation}`
-        );
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Database ${database} created successfully`,
-            },
-          ],
-        };
-      }
-
-      case "drop_database": {
-        const p = await getPool();
-        const database = args?.database as string;
-
-        await p.execute(`DROP DATABASE \`${database}\``);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Database ${database} dropped successfully`,
-            },
-          ],
-        };
-      }
-
-      case "use_database": {
-        const p = await getPool();
-        const database = args?.database as string;
-
-        await p.query(`USE \`${database}\``);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Switched to database ${database}`,
-            },
-          ],
-        };
-      }
-
-      case "create_index": {
-        const p = await getPool();
-        const table = args?.table as string;
-        const indexName = args?.indexName as string;
-        const columns = args?.columns as string[];
-        const unique = args?.unique as boolean | undefined;
-        const database = args?.database as string | undefined;
-
-        const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
-        const columnList = columns.map((c) => `\`${c}\``).join(", ");
-        const uniqueStr = unique ? "UNIQUE " : "";
-
-        await p.execute(
-          `CREATE ${uniqueStr}INDEX \`${indexName}\` ON ${tableName} (${columnList})`
-        );
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Index ${indexName} created successfully on ${table}`,
-            },
-          ],
-        };
-      }
-
-      case "drop_index": {
-        const p = await getPool();
-        const table = args?.table as string;
-        const indexName = args?.indexName as string;
-        const database = args?.database as string | undefined;
-
-        const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
-        await p.execute(`DROP INDEX \`${indexName}\` ON ${tableName}`);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Index ${indexName} dropped from ${table}`,
-            },
-          ],
-        };
-      }
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
+    // Close existing pool if any
+    if (pool) {
+      await pool.end();
     }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    pool = mysql.createPool(config);
+
+    // Test connection
+    const connection = await pool.getConnection();
+    connection.release();
+
+    const output = {
+      success: true,
+      host: config.host,
+      port: config.port,
+      database: config.database || null,
+    };
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `Error: ${errorMessage}`,
+          text: `Successfully connected to MySQL server at ${config.host}:${config.port}${config.database ? ` (database: ${config.database})` : ""}`,
         },
       ],
-      isError: true,
+      structuredContent: output,
     };
   }
+);
+
+// Tool: query
+server.tool(
+  "query",
+  "Execute a SELECT query and return results. Use this for reading data.",
+  {
+    sql: z.string().describe("SQL SELECT query to execute"),
+    params: z.array(z.unknown()).optional().describe("Query parameters for prepared statement"),
+  },
+  async ({ sql, params }) => {
+    // Validate that this is a read-only query
+    validateReadOnlyQuery(sql);
+
+    const p = await getPool();
+    const [rows] = await p.query<RowDataPacket[]>(sql, params || []);
+
+    const output = {
+      rows: rows as Record<string, unknown>[],
+      rowCount: rows.length,
+    };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(rows, null, 2),
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: execute
+server.tool(
+  "execute",
+  "Execute an INSERT, UPDATE, DELETE or other modifying query. Returns affected rows count.",
+  {
+    sql: z.string().describe("SQL query to execute"),
+    params: z.array(z.unknown()).optional().describe("Query parameters for prepared statement"),
+  },
+  async ({ sql, params }) => {
+    const p = await getPool();
+
+    // Check if the operation is allowed
+    checkSqlPermission(sql);
+
+    const [result] = await p.execute<ResultSetHeader>(sql, params || []);
+
+    const output = {
+      affectedRows: result.affectedRows,
+      insertId: result.insertId,
+      changedRows: result.changedRows,
+    };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(output, null, 2),
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: list_databases
+server.tool(
+  "list_databases",
+  "List all databases on the MySQL server",
+  {},
+  async () => {
+    const p = await getPool();
+    const [rows] = await p.query<RowDataPacket[]>("SHOW DATABASES");
+
+    const databases = rows.map((row) => row.Database as string);
+    const output = { databases };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(databases, null, 2),
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: list_tables
+server.tool(
+  "list_tables",
+  "List all tables in the current or specified database",
+  {
+    database: z.string().optional().describe("Database name (optional, uses current if not specified)"),
+  },
+  async ({ database }) => {
+    const p = await getPool();
+
+    let sql = "SHOW TABLES";
+    if (database) {
+      sql = `SHOW TABLES FROM \`${database}\``;
+    }
+
+    const [rows] = await p.query<RowDataPacket[]>(sql);
+
+    const tables = rows.map((row) => Object.values(row)[0] as string);
+    const output = { tables, database: database || null };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(tables, null, 2),
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: describe_table
+server.tool(
+  "describe_table",
+  "Get the structure/schema of a table",
+  {
+    table: z.string().describe("Table name"),
+    database: z.string().optional().describe("Database name (optional)"),
+  },
+  async ({ table, database }) => {
+    const p = await getPool();
+
+    const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
+    const [rows] = await p.query<RowDataPacket[]>(`DESCRIBE ${tableName}`);
+
+    const columns = rows as Array<{
+      Field: string;
+      Type: string;
+      Null: string;
+      Key: string;
+      Default: string | null;
+      Extra: string;
+    }>;
+    const output = { table, database: database || null, columns };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(rows, null, 2),
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Column definition schema for create_table
+const columnSchema = z.object({
+  name: z.string().describe("Column name"),
+  type: z.string().describe("Column type (e.g., VARCHAR(255), INT, TEXT)"),
+  nullable: z.boolean().optional().describe("Whether column can be null"),
+  primaryKey: z.boolean().optional().describe("Whether this is the primary key"),
+  autoIncrement: z.boolean().optional().describe("Whether to auto increment"),
+  default: z.string().optional().describe("Default value"),
 });
+
+// Tool: create_table
+server.tool(
+  "create_table",
+  "Create a new table with specified columns",
+  {
+    table: z.string().describe("Table name"),
+    columns: z.array(columnSchema).describe("Column definitions"),
+    database: z.string().optional().describe("Database name (optional)"),
+  },
+  async ({ table, columns, database }) => {
+    const p = await getPool();
+
+    const columnDefs = columns.map((col) => {
+      let def = `\`${col.name}\` ${col.type}`;
+      if (col.nullable === false) def += " NOT NULL";
+      if (col.autoIncrement) def += " AUTO_INCREMENT";
+      if (col.default !== undefined) def += ` DEFAULT ${col.default}`;
+      if (col.primaryKey) def += " PRIMARY KEY";
+      return def;
+    });
+
+    const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
+    const sql = `CREATE TABLE ${tableName} (${columnDefs.join(", ")})`;
+
+    await p.execute(sql);
+
+    const output = { success: true, table, database: database || null };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Table ${table} created successfully`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: alter_table
+server.tool(
+  "alter_table",
+  "Modify an existing table structure",
+  {
+    table: z.string().describe("Table name"),
+    operation: z.enum(["ADD", "DROP", "MODIFY", "RENAME"]).describe("Type of alteration"),
+    column: z.string().describe("Column name"),
+    definition: z.string().optional().describe("Column definition for ADD/MODIFY (e.g., 'VARCHAR(255) NOT NULL')"),
+    newName: z.string().optional().describe("New name for RENAME operation"),
+    database: z.string().optional().describe("Database name (optional)"),
+  },
+  async ({ table, operation, column, definition, newName, database }) => {
+    const p = await getPool();
+
+    const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
+    let sql: string;
+
+    switch (operation) {
+      case "ADD":
+        sql = `ALTER TABLE ${tableName} ADD COLUMN \`${column}\` ${definition}`;
+        break;
+      case "DROP":
+        sql = `ALTER TABLE ${tableName} DROP COLUMN \`${column}\``;
+        break;
+      case "MODIFY":
+        sql = `ALTER TABLE ${tableName} MODIFY COLUMN \`${column}\` ${definition}`;
+        break;
+      case "RENAME":
+        sql = `ALTER TABLE ${tableName} RENAME COLUMN \`${column}\` TO \`${newName}\``;
+        break;
+      default:
+        throw new Error(`Unknown operation: ${operation}`);
+    }
+
+    await p.execute(sql);
+
+    const output = {
+      success: true,
+      table,
+      operation,
+      column,
+      newName: newName || null,
+      database: database || null,
+    };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Table ${table} altered successfully (${operation} ${column})`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: drop_table
+server.tool(
+  "drop_table",
+  "Drop/delete a table",
+  {
+    table: z.string().describe("Table name"),
+    database: z.string().optional().describe("Database name (optional)"),
+  },
+  async ({ table, database }) => {
+    const p = await getPool();
+
+    const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
+    await p.execute(`DROP TABLE ${tableName}`);
+
+    const output = { success: true, table, database: database || null };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Table ${table} dropped successfully`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: create_database
+server.tool(
+  "create_database",
+  "Create a new database",
+  {
+    database: z.string().describe("Database name"),
+    charset: z.string().optional().describe("Character set (default: utf8mb4)"),
+    collation: z.string().optional().describe("Collation (default: utf8mb4_unicode_ci)"),
+  },
+  async ({ database, charset, collation }) => {
+    const p = await getPool();
+    const cs = charset || "utf8mb4";
+    const col = collation || "utf8mb4_unicode_ci";
+
+    await p.execute(
+      `CREATE DATABASE \`${database}\` CHARACTER SET ${cs} COLLATE ${col}`
+    );
+
+    const output = { success: true, database, charset: cs, collation: col };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Database ${database} created successfully`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: drop_database
+server.tool(
+  "drop_database",
+  "Drop/delete a database",
+  {
+    database: z.string().describe("Database name"),
+  },
+  async ({ database }) => {
+    const p = await getPool();
+
+    await p.execute(`DROP DATABASE \`${database}\``);
+
+    const output = { success: true, database };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Database ${database} dropped successfully`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: use_database
+server.tool(
+  "use_database",
+  "Switch to a different database",
+  {
+    database: z.string().describe("Database name"),
+  },
+  async ({ database }) => {
+    const p = await getPool();
+
+    await p.query(`USE \`${database}\``);
+
+    const output = { success: true, database };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Switched to database ${database}`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: create_index
+server.tool(
+  "create_index",
+  "Create an index on a table",
+  {
+    table: z.string().describe("Table name"),
+    indexName: z.string().describe("Index name"),
+    columns: z.array(z.string()).describe("Column names to index"),
+    unique: z.boolean().optional().describe("Whether this is a unique index"),
+    database: z.string().optional().describe("Database name (optional)"),
+  },
+  async ({ table, indexName, columns, unique, database }) => {
+    const p = await getPool();
+
+    const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
+    const columnList = columns.map((c) => `\`${c}\``).join(", ");
+    const uniqueStr = unique ? "UNIQUE " : "";
+
+    await p.execute(
+      `CREATE ${uniqueStr}INDEX \`${indexName}\` ON ${tableName} (${columnList})`
+    );
+
+    const output = {
+      success: true,
+      table,
+      indexName,
+      columns,
+      unique: unique || false,
+      database: database || null,
+    };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Index ${indexName} created successfully on ${table}`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: drop_index
+server.tool(
+  "drop_index",
+  "Drop an index from a table",
+  {
+    table: z.string().describe("Table name"),
+    indexName: z.string().describe("Index name"),
+    database: z.string().optional().describe("Database name (optional)"),
+  },
+  async ({ table, indexName, database }) => {
+    const p = await getPool();
+
+    const tableName = database ? `\`${database}\`.\`${table}\`` : `\`${table}\``;
+    await p.execute(`DROP INDEX \`${indexName}\` ON ${tableName}`);
+
+    const output = {
+      success: true,
+      table,
+      indexName,
+      database: database || null,
+    };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Index ${indexName} dropped from ${table}`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
+
+// Tool: health_check
+server.tool(
+  "health_check",
+  "Check database connection health and get server status",
+  {},
+  async () => {
+    const startTime = Date.now();
+    const p = await getPool();
+
+    // Test connection with ping
+    const connection = await p.getConnection();
+    await connection.ping();
+    connection.release();
+
+    const pingLatency = Date.now() - startTime;
+
+    // Get server version and status
+    const [versionRows] = await p.query<RowDataPacket[]>("SELECT VERSION() as version");
+    const [statusRows] = await p.query<RowDataPacket[]>("SHOW STATUS WHERE Variable_name IN ('Uptime', 'Threads_connected', 'Questions')");
+
+    const version = versionRows[0]?.version || "unknown";
+    const status: Record<string, string> = {};
+    for (const row of statusRows) {
+      status[row.Variable_name] = row.Value;
+    }
+
+    const output = {
+      healthy: true,
+      pingLatencyMs: pingLatency,
+      serverVersion: version,
+      uptime: status.Uptime ? parseInt(status.Uptime, 10) : null,
+      threadsConnected: status.Threads_connected ? parseInt(status.Threads_connected, 10) : null,
+      totalQueries: status.Questions ? parseInt(status.Questions, 10) : null,
+    };
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Database connection healthy (ping: ${pingLatency}ms, version: ${version})`,
+        },
+      ],
+      structuredContent: output,
+    };
+  }
+);
 
 // Start server
 async function main() {
