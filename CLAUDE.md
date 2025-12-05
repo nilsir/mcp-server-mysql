@@ -63,3 +63,16 @@ Add to `claude_desktop_config.json`:
   }
 }
 ```
+
+## Release Workflow
+
+When releasing a new version, follow these steps in order:
+
+1. Update version in `package.json`
+2. Commit changes: `git add . && git commit -m "chore: release vX.X.X"`
+3. Create git tag: `git tag -a vX.X.X -m "vX.X.X"`
+4. Push to GitHub: `git push origin master --tags`
+5. Create GitHub release: `gh release create vX.X.X --title "vX.X.X" --notes "..."`
+6. Publish to npm: `npm publish --access public`
+
+**Important**: GitHub and npm versions must always be in sync.

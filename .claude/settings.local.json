@@ -9,7 +9,13 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(npm publish:*)",
-      "Bash(npm pkg fix)"
+      "Bash(npm pkg fix)",
+      "Bash(git tag:*)",
+      "Bash(git push:*)",
+      "Bash(gh release create:*)",
+      "Bash(brew install:*)",
+      "Bash(gh auth status:*)",
+      "Bash(gh repo edit:*)"
     ],
     "deny": [],
     "ask": []
