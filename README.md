@@ -41,6 +41,16 @@ export MYSQL_ALLOW_DELETE=false  # Set to "false" to disable DELETE
 
 Or use the `connect` tool at runtime to specify connection parameters.
 
+## Supported AI Applications
+
+This MCP server can be used with any application that supports the Model Context Protocol (MCP):
+
+- **[Claude Desktop](https://claude.ai/download)** - Anthropic's official desktop application
+- **[Claude Code](https://github.com/anthropics/claude-code)** - Anthropic's official CLI tool for developers
+- **[Cline](https://github.com/cline/cline)** - AI coding assistant VS Code extension
+- **[Zed](https://zed.dev/)** - High-performance code editor with built-in AI
+- **Any MCP-compatible application** - MCP is an open protocol developed by Anthropic
+
 ## Usage with Claude Desktop
 
 ### Using npx (Recommended)
